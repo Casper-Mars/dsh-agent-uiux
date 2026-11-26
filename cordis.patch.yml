@@ -1,0 +1,91 @@
+# dsh-agent-uiux bundle patch —— 单一角色：UI/UX 设计师
+#
+# 结构：一次 insert 完成两层装配 —— preset 注册表默认值与唯一的 agent preset（preset-uiux）。
+# persona 与领域 Skill 都由 preset 的 `uiux-assets` 在 agent scope 注册（不再有宿主层插件）。
+#
+# 角色资产（领域 Skill）不在宿主层：preset 的 plugins 首项挂 `dsh-agent-uiux/assets`，
+# 注册进该 preset 的 scope 层，单 host 装多个角色包时技能不会并成一份。
+#
+# 结构由 tests/patch.spec.ts 断言：恰好一个 insert、两条装配、12 项工具面；
+# 只有 tool-todo 带 config，其余工具带 config 会被测试拒绝。
+# 硬约束：合并进同一 profile 时，`agent-preset-registry` 只由 cto 包插入（本包不重复插）。
+
+- insert:
+    - id: agent-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        # 主会话 + 驿传 ensureSession 的默认 preset 都取这里
+        default: uiux
+
+    - id: preset-uiux
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: uiux
+        name: UI/UX 设计师
+        description: 设计师：方向定位、设计系统、线框、效果图、评审与交接。
+        order: 10
+        plugins:
+          - id: uiux-assets
+            name: dsh-agent-uiux/assets
+          # 工具呈现方式（agent scope 级）：UIUX 也用 PTC，多工具设计流程在 run_code 内组合。
+          - id: tool-presentation
+            name: '@deepseek-ai/dsh-agent-tool-presentation'
+            config:
+              mode: ptc
+          - id: echuan-tools
+            name: dsh-echuan/tools/requester
+          - id: task-tools
+            name: dsh-agent-base/tools/task-readonly
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: false
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: tool-subagent-fork
+            name: '@deepseek-ai/dsh-tool-subagent'
+            config:
+              provider: fork
+              toolName: subagent_fork
+              maxDepth: 1
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed only to keep the request shape stable. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - id: workflow
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'

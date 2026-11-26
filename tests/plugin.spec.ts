@@ -1,0 +1,449 @@
+/**
+ * `src/plugin.ts` 的装配契约（任务-03）。
+ *
+ * 不引入旧核心包、不启动真实 core：用最小 fake `ctx` 复刻插件依赖的三样东西
+ * —— `skills` 注册表、`agents` 生命周期事件、per-agent `systemPrompt` 服务 ——
+ * 覆盖注册参数、缺失降级、原子回滚、depth gate、幂等、LIFO 卸载、重装与
+ * 「注册全程 0 次写盘」。
+ */
+import { dirname } from 'node:path'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
+
+/**
+ * 把 `node:fs` 的写盘 API 全部换成 spy（真实实现保留）。
+ *
+ * `src/firmware.ts` 的 `readFileSync` 仍是真实读取，任何组件一旦尝试写盘都会被
+ * 记录 —— 「注册只读」这条验收因此可以被直接断言。
+ */
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  const wrap = (fn: unknown) => vi.fn(fn as (...args: unknown[]) => unknown)
+  return {
+    ...actual,
+    writeFileSync: wrap(actual.writeFileSync),
+    writeFile: wrap(actual.writeFile),
+    appendFileSync: wrap(actual.appendFileSync),
+    appendFile: wrap(actual.appendFile),
+    mkdirSync: wrap(actual.mkdirSync),
+    mkdir: wrap(actual.mkdir),
+    rmSync: wrap(actual.rmSync),
+    rm: wrap(actual.rm),
+    unlinkSync: wrap(actual.unlinkSync),
+    unlink: wrap(actual.unlink),
+    renameSync: wrap(actual.renameSync),
+    rename: wrap(actual.rename),
+    copyFileSync: wrap(actual.copyFileSync),
+    copyFile: wrap(actual.copyFile),
+    truncateSync: wrap(actual.truncateSync),
+    createWriteStream: wrap(actual.createWriteStream),
+  }
+})
+
+import * as fs from 'node:fs'
+import { registerDomainFirmwareSkills } from '../src/plugin'
+import { apply as applyAssets } from '../src/assets'
+import { UIUX_DOMAIN } from '../src/domain'
+import { UIUX_PERSONA } from '../src/persona'
+import type { FirmwareSkill } from '../src/firmware'
+
+/* ------------------------------------------------------------------ *
+ * 最小 fake Cordis 运行时
+ * ------------------------------------------------------------------ */
+
+/** 可 await 的 fiber（`await fiber` 立即完成；`dispose()` 幂等）。 */
+class FakeFiber {
+  disposed = false
+
+  constructor(private readonly onDispose: () => unknown = () => {}) {}
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return
+    this.disposed = true
+    await this.onDispose()
+  }
+
+  // resolve 值必须是 undefined：resolve(this) 会让 thenable 递归自解析。
+  then<TResult1 = void, TResult2 = never>(
+    onFulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
+    onRejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): Promise<TResult1 | TResult2> {
+    return Promise.resolve()
+      .then(() => (onFulfilled ? onFulfilled() : (undefined as unknown as TResult1)))
+      .catch((error) => {
+        if (onRejected) return onRejected(error) as TResult2
+        throw error
+      })
+  }
+}
+
+type Listener = (payload: unknown) => unknown
+
+/** 复刻插件用到的 Context 子集。 */
+class FakeContext {
+  readonly services = new Map<string, unknown>()
+  readonly effects: Array<{ label: string; fiber: FakeFiber }> = []
+  readonly injectCalls: string[][] = []
+  readonly injectFibers: FakeFiber[] = []
+  private readonly listeners = new Map<string, Set<Listener>>()
+
+  readonly reflect = {
+    get: (name: string): unknown => this.services.get(name),
+  }
+
+  constructor(services: Record<string, unknown> = {}) {
+    for (const [key, value] of Object.entries(services)) this.services.set(key, value)
+  }
+
+  get(name: string): unknown {
+    return this.services.get(name)
+  }
+
+  setService(name: string, value: unknown): void {
+    this.services.set(name, value)
+  }
+
+  /** 立即执行装配回调，把返回的清理函数包成 fiber。 */
+  effect(callback: () => unknown, label = 'effect'): FakeFiber {
+    const result = callback()
+    const fiber = new FakeFiber(async () => {
+      if (typeof result === 'function') await (result as () => unknown)()
+    })
+    this.effects.push({ label, fiber })
+    return fiber
+  }
+
+  on(event: string, listener: Listener): () => void {
+    let set = this.listeners.get(event)
+    if (set === undefined) {
+      set = new Set()
+      this.listeners.set(event, set)
+    }
+    set.add(listener)
+    return () => {
+      set.delete(listener)
+    }
+  }
+
+  async emit(event: string, payload: unknown): Promise<void> {
+    const set = this.listeners.get(event)
+    if (set === undefined) return
+    for (const listener of [...set]) await listener(payload)
+  }
+
+  listenerCount(event: string): number {
+    return this.listeners.get(event)?.size ?? 0
+  }
+
+  /** per-agent scope：`inject(deps, cb)` 提供带 `systemPrompt` 的 scoped ctx。 */
+  inject(deps: string[], callback: (scoped: unknown) => unknown): FakeFiber {
+    this.injectCalls.push([...deps])
+    const scopedFibers: FakeFiber[] = []
+    const services = this.services
+    const scoped = {
+      effect: (fn: () => unknown): FakeFiber => {
+        const dispose = fn()
+        const fiber = new FakeFiber(async () => {
+          if (typeof dispose === 'function') await dispose()
+        })
+        scopedFibers.push(fiber)
+        return fiber
+      },
+      get systemPrompt(): unknown {
+        return services.get('systemPrompt')
+      },
+    }
+
+    const result = callback(scoped)
+    const fiber = new FakeFiber(async () => {
+      for (const scopedFiber of [...scopedFibers].reverse()) await scopedFiber.dispose()
+      if (typeof result === 'function') await (result as () => unknown)()
+    })
+    this.injectFibers.push(fiber)
+    return fiber
+  }
+}
+
+/** 记录注册 / 反注册顺序的假 skills 注册表；`failAt` 用于中途失败用例。 */
+function createSkillRegistry(options: { failAt?: number } = {}) {
+  const registered: string[] = []
+  const unregistered: string[] = []
+  const definitions = new Map<string, Record<string, unknown>>()
+  let calls = 0
+
+  return {
+    registered,
+    unregistered,
+    definitions,
+    register(registration: Record<string, unknown>) {
+      calls += 1
+      if (options.failAt === calls) throw new Error('boom')
+      const name = registration.name as string
+      registered.push(name)
+      definitions.set(name, registration)
+      let done = false
+      return () => {
+        if (done) return
+        done = true
+        unregistered.push(name)
+        definitions.delete(name)
+      }
+    },
+    get(name: string) {
+      return Promise.resolve(definitions.get(name))
+    },
+  }
+}
+
+/** 记录 section 注册与释放的假 systemPrompt。 */
+function createSystemPrompt() {
+  const sections: Array<{ name: string; order: number; text: string; disposed: boolean }> = []
+  return {
+    sections,
+    section(input: { name: string; order: number; text: string }) {
+      const entry = { ...input, disposed: false }
+      sections.push(entry)
+      return () => {
+        entry.disposed = true
+      }
+    },
+    getSectionOrder(name: string) {
+      return name === 'DEPLOYMENT_PERSONA_PREFIX' ? 100 : 0
+    },
+  }
+}
+
+/** 装配 ctx：skills + systemPrompt + logger。 */
+function createHostContext(registryOptions: { failAt?: number } = {}) {
+  const registry = createSkillRegistry(registryOptions)
+  const warns: string[] = []
+  const context = new FakeContext({
+    skills: registry,
+    systemPrompt: createSystemPrompt(),
+    logger: { warn: (message: string) => warns.push(message) },
+  })
+  return { context, registry, warns }
+}
+
+const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+/** 期望的 Skill 名（与 domain 声明一致）。 */
+const EXPECTED_NAMES = UIUX_DOMAIN.skills.map((skill) => skill.name)
+
+/** 构造一个 frontmatter 完整的内联 Skill（回滚用例不依赖磁盘）。 */
+function inlineSkill(name: string): FirmwareSkill {
+  return {
+    name,
+    markdown: ['---', `name: ${name}`, 'description: 描述', 'whenToUse: 何时使用', '---', '# 正文'].join('\n'),
+  }
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+})
+
+/* ------------------------------------------------------------------ *
+ * 1. Skill 注册契约
+ * ------------------------------------------------------------------ */
+
+describe('领域 Skill 注册（uiux-assets，preset 层）', () => {
+  it('注册次数与声明一致，参数全部合规（runtime / directory / 正文不含 frontmatter）', () => {
+    const { context, registry } = createHostContext()
+    applyAssets(context)
+
+    expect(registry.registered).toEqual(EXPECTED_NAMES)
+    expect(registry.definitions.size).toBe(EXPECTED_NAMES.length)
+
+    for (const [name, registration] of registry.definitions) {
+      const path = registration.path as string
+      expect(registration.name).toBe(name)
+      expect(registration.source).toBe('runtime')
+      expect(registration.invocation).toEqual({ modelInvocable: true, userInvocable: true })
+      expect(path.startsWith('/')).toBe(true)
+      expect(path.endsWith(`${name}/SKILL.md`)).toBe(true)
+      expect(registration.resourceBase).toEqual({ kind: 'directory', path: dirname(path) })
+      expect(registration.content.startsWith('---')).toBe(false)
+      expect((registration.content as string).trim().length).toBeGreaterThan(0)
+      expect((registration.description as string).trim().length).toBeGreaterThan(0)
+      expect((registration.whenToUse as string).trim().length).toBeGreaterThan(0)
+    }
+  })
+
+  it('ctx.skills 缺失时降级：只 warn，不抛错，不注册任何 Skill', () => {
+    const warns: string[] = []
+    const context = new FakeContext({
+      logger: { warn: (message: string) => warns.push(message) },
+    })
+
+    expect(() => applyAssets(context)).not.toThrow()
+    expect(warns.some((line) => line.includes('ctx.skills'))).toBe(true)
+    expect(warns.some((line) => line.includes('跳过领域 Skill 注册'))).toBe(true)
+  })
+
+  it('注册中途失败 → 已注册项按逆序原子回滚，占位释放', () => {
+    const registry = createSkillRegistry({ failAt: 2 })
+    const warns: string[] = []
+    const ctx = new FakeContext({ skills: registry }) as unknown as Parameters<
+      typeof registerDomainFirmwareSkills
+    >[0]
+    const logger = { warn: (message: string) => warns.push(message) }
+
+    let error: unknown
+    try {
+      registerDomainFirmwareSkills(ctx, [inlineSkill('alpha-skill'), inlineSkill('beta-skill')], logger)
+    } catch (caught) {
+      error = caught
+    }
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('已回滚')
+    expect((error as Error).message).toContain('alpha-skill')
+    expect((error as Error).message).toContain('boom')
+    expect((error as Error).message).toMatch(/^\[uiux\]/)
+    expect(registry.unregistered).toEqual(['alpha-skill'])
+    expect(registry.definitions.size).toBe(0)
+  })
+
+  it('apply 阶段注册失败 → 向上抛出且不留下半个注册表', () => {
+    const { context, registry } = createHostContext({ failAt: 1 })
+
+    expect(() => applyAssets(context)).toThrowError(/^\[uiux\] 注册领域 Skill 失败/)
+    expect(registry.definitions.size).toBe(0)
+  })
+
+  it('连续两次 apply → 第二次全部跳过，不重复注册', () => {
+    const { context, registry, warns } = createHostContext()
+
+    applyAssets(context)
+    applyAssets(context)
+
+    expect(registry.registered).toHaveLength(EXPECTED_NAMES.length)
+    expect(registry.definitions.size).toBe(EXPECTED_NAMES.length)
+    expect(warns.some((line) => line.includes(`跳过 ${EXPECTED_NAMES.length} 个领域 Skill`))).toBe(true)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 2. persona（preset 层）
+ * ------------------------------------------------------------------ */
+
+describe('PM persona（uiux-assets，preset 层）', () => {
+  it('注册 deployment:persona-prefix 槽位，正文与 UIUX_PERSONA 一致', () => {
+    const prompt = createSystemPrompt()
+    const context = new FakeContext({
+      skills: createSkillRegistry(),
+      systemPrompt: prompt,
+      logger: { warn: () => {} },
+    })
+    applyAssets(context)
+
+    expect(prompt.sections).toHaveLength(1)
+    expect(prompt.sections[0]).toMatchObject({
+      name: 'deployment:persona-prefix',
+      order: 100,
+      text: UIUX_PERSONA,
+    })
+  })
+
+  it('systemPrompt 缺失 → 只 warn，领域 Skill 仍全部注册', () => {
+    const warns: string[] = []
+    const registry = createSkillRegistry()
+    const context = new FakeContext({
+      skills: registry,
+      logger: { warn: (message: string) => warns.push(message) },
+    })
+    applyAssets(context)
+
+    expect(registry.registered).toHaveLength(EXPECTED_NAMES.length)
+    expect(warns.some((line) => line.includes('persona'))).toBe(true)
+  })
+
+  it('scope 卸载 → persona section 被释放（切换 preset 时旧人设随之消失）', async () => {
+    const prompt = createSystemPrompt()
+    const context = new FakeContext({
+      skills: createSkillRegistry(),
+      systemPrompt: prompt,
+      logger: { warn: () => {} },
+    })
+    applyAssets(context)
+
+    const effect = context.effects.find((item) => item.label === 'uiux-assets:persona')
+    expect(effect).toBeDefined()
+    await (effect as { fiber: FakeFiber }).fiber.dispose()
+    expect(prompt.sections[0]?.disposed).toBe(true)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 3. 卸载
+ * ------------------------------------------------------------------ */
+
+describe('插件卸载', () => {
+  it('dispose 技能 effect → 全部 unregister 按 LIFO 调用', async () => {
+    const { context, registry } = createHostContext()
+    applyAssets(context)
+    expect(registry.unregistered).toEqual([])
+
+    const skillsEffect = context.effects.find((item) => item.label === 'uiux-assets:register-skills')
+    expect(skillsEffect).toBeDefined()
+    await (skillsEffect as { fiber: FakeFiber }).fiber.dispose()
+
+    expect(registry.unregistered).toEqual([...registry.registered].reverse())
+    expect(registry.unregistered).toHaveLength(EXPECTED_NAMES.length)
+    expect(registry.definitions.size).toBe(0)
+  })
+
+  it('卸载后再装配 → Skill 可重新注册（占位已释放）', async () => {
+    const { context, registry } = createHostContext()
+    applyAssets(context)
+    const skillsEffect = context.effects.find((item) => item.label === 'uiux-assets:register-skills')
+    await (skillsEffect as { fiber: FakeFiber }).fiber.dispose()
+    expect(registry.definitions.size).toBe(0)
+
+    applyAssets(context)
+    expect(registry.registered).toHaveLength(EXPECTED_NAMES.length * 2)
+    expect(registry.definitions.size).toBe(EXPECTED_NAMES.length)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * 4. 只读：注册路径不得写盘
+ * ------------------------------------------------------------------ */
+
+describe('注册只读', () => {
+  it('装配 + 注册 + 卸载全程 0 次写盘调用', async () => {
+    const context = new FakeContext({
+      skills: createSkillRegistry(),
+      systemPrompt: createSystemPrompt(),
+      logger: { warn: () => {} },
+    })
+    applyAssets(context)
+    await flush()
+
+    for (const item of [...context.effects].reverse()) await item.fiber.dispose()
+
+    const writeApis = [
+      'writeFileSync',
+      'writeFile',
+      'appendFileSync',
+      'appendFile',
+      'mkdirSync',
+      'mkdir',
+      'rmSync',
+      'rm',
+      'unlinkSync',
+      'unlink',
+      'renameSync',
+      'rename',
+      'copyFileSync',
+      'copyFile',
+      'truncateSync',
+      'createWriteStream',
+    ] as const
+
+    for (const api of writeApis) {
+      const spy = (fs as unknown as Record<string, { mock?: { calls: unknown[] } }>)[api]
+      expect(spy?.mock, `${api} 未被 spy 包裹`).toBeDefined()
+      expect(spy?.mock?.calls.length, `${api} 被调用了`).toBe(0)
+    }
+  })
+})
